@@ -1,0 +1,195 @@
+%% Parameters
+% Initialize constants and variables
+N = 256; % length of signal (must be even in this example)
+M = 64;  % size of the subset
+S = 2;   % sparsity in the frequency domain
+
+
+%% Generate signal with S randomly spread sinusoids
+% Note that a real-valued sinusoid has two peaks in the frequency domain
+freq = randperm(N/2)-1;
+freq = freq(1:S).';
+n = 0:N-1;
+y = sum(sin(2*pi*freq/N*n).', 2);
+
+
+%% Fourier representation of the signal
+fft1 = fft(eye(N));
+x = fft1*y;
+
+
+%% Perform compressed sensing
+% M measurements obtained randomly
+subset = randperm(N);
+subset = subset(1:M);
+y_subset = y(subset); % subset of observed sensed values
+
+% Base for representing the signal. This is the inverse of the Fourier
+% transform FFT1, which can be computed as the conjugate of FFT normalized
+% by N.
+psi = conj(fft1)/N;
+
+% Reconstructed Fourier representation
+x_hat = l1eq_pd(x0, Q, [], y, 1e-2);
+
+% Reconstructed signal
+y_hat = real(psi*x_hat);
+
+
+%l1function
+
+function xp = l1eq_pd(x0, A, At, b, pdtol, pdmaxiter, cgtol, cgmaxiter)
+largescale = isa(A,'function_handle');
+if (nargin < 5), pdtol = 1e-3; end
+if (nargin < 6), pdmaxiter = 50; end
+if (nargin < 7), cgtol = 1e-8; end
+if (nargin < 8), cgmaxiter = 200; end
+N = length(x0);
+alpha = 0.01;
+beta = 0.5;
+mu = 10;
+gradf0 = [zeros(N,1); ones(N,1)];
+% starting point --- make sure that it is feasible
+if (largescale)
+if (norm(A(x0)-b)/norm(b) > cgtol)
+ disp('Starting point infeasible; using x0 = At*inv(AAt)*y.');
+ AAt = @(z) A(At(z));
+ [w, cgres, cgiter] = cgsolve(AAt, b, cgtol, cgmaxiter, 0);
+if (cgres > 1/2)
+ disp('A*At is ill-conditioned: cannot find starting point');
+ xp = x0;
+return;
+end
+ x0 = At(w);
+end
+else
+if (norm(A*x0-b)/norm(b) > cgtol)
+ disp('Starting point infeasible; using x0 = At*inv(AAt)*y.');
+ opts.POSDEF = true; opts.SYM = true;
+ [w, hcond] = linsolve(A*A', b, opts);
+if (hcond < 1e-14)
+ disp('A*At is ill-conditioned: cannot find starting point');
+ xp = x0;
+return;
+end
+ x0 = A'*w;
+end
+end
+x = x0;
+u = (0.95)*abs(x0) + (0.10)*max(abs(x0));
+% set up for the first iteration
+fu1 = x - u;
+fu2 = -x - u;
+lamu1 = -1./fu1;
+lamu2 = -1./fu2;
+if (largescale)
+ v = -A(lamu1-lamu2);
+ Atv = At(v);
+ rpri = A(x) - b;
+else
+ v = -A*(lamu1-lamu2);
+ Atv = A'*v;
+ rpri = A*x - b;
+end
+sdg = -(fu1'*lamu1 + fu2'*lamu2);
+tau = mu*2*N/sdg;
+rcent = [-lamu1.*fu1; -lamu2.*fu2] - (1/tau);
+rdual = gradf0 + [lamu1-lamu2; -lamu1-lamu2] + [Atv; zeros(N,1)];
+resnorm = norm([rdual; rcent; rpri]);
+pditer = 0;
+done = (sdg < pdtol) | (pditer >= pdmaxiter);
+while (~done)
+
+pditer = pditer + 1;
+
+w1 = -1/tau*(-1./fu1 + 1./fu2) - Atv;
+w2 = -1 - 1/tau*(1./fu1 + 1./fu2);
+w3 = -rpri;
+
+sig1 = -lamu1./fu1 - lamu2./fu2;
+sig2 = lamu1./fu1 - lamu2./fu2;
+sigx = sig1 - sig2.^2./sig1;
+
+if (largescale)
+ w1p = w3 - A(w1./sigx - w2.*sig2./(sigx.*sig1));
+ h11pfun = @(z) -A(1./sigx.*At(z));
+[dv, cgres, cgiter] = cgsolve(h11pfun, w1p, cgtol, cgmaxiter, 0);
+if (cgres > 1/2)
+ disp('Cannot solve system. Returning previous iterate. (See Section 4 of notes for more information.)');
+ xp = x;
+return
+end
+ dx = (w1 - w2.*sig2./sig1 - At(dv))./sigx;
+ Adx = A(dx);
+ Atdv = At(dv);
+else
+ w1p = -(w3 - A*(w1./sigx - w2.*sig2./(sigx.*sig1)));
+ H11p = A*(sparse(diag(1./sigx))*A');
+ opts.POSDEF = true; opts.SYM = true;
+ [dv,hcond] = linsolve(H11p, w1p, opts);
+if (hcond < 1e-14)
+ disp('Matrix ill-conditioned. Returning previous iterate. (See Section 4 of notes for more information.)');
+ xp = x;
+return
+end
+ dx = (w1 - w2.*sig2./sig1 - A'*dv)./sigx;
+ Adx = A*dx;
+ Atdv = A'*dv;
+end
+
+ du = (w2 - sig2.*dx)./sig1;
+
+ dlamu1 = (lamu1./fu1).*(-dx+du) - lamu1 - (1/tau)*1./fu1;
+ dlamu2 = (lamu2./fu2).*(dx+du) - lamu2 - 1/tau*1./fu2;
+
+ % make sure that the step is feasible: keeps lamu1,lamu2 > 0, fu1,fu2 < 0
+ indp = find(dlamu1 < 0); indn = find(dlamu2 < 0);
+ s = min([1; -lamu1(indp)./dlamu1(indp); -lamu2(indn)./dlamu2(indn)]);
+ indp = find((dx-du) > 0); indn = find((-dx-du) > 0);
+ s = (0.99)*min([s; -fu1(indp)./(dx(indp)-du(indp)); -fu2(indn)./(-dx(indn)-du(indn))]);
+
+ % backtracking line search
+ suffdec = 0;
+ backiter = 0;
+while (~suffdec)
+ xp = x + s*dx; up = u + s*du;
+ vp = v + s*dv; Atvp = Atv + s*Atdv;
+ lamu1p = lamu1 + s*dlamu1; lamu2p = lamu2 + s*dlamu2; 
+ fu1p = xp - up; fu2p = -xp - up;
+ rdp = gradf0 + [lamu1p-lamu2p; -lamu1p-lamu2p] + [Atvp; zeros(N,1)];
+ rcp = [-lamu1p.*fu1p; -lamu2p.*fu2p] - (1/tau);
+ rpp = rpri + s*Adx;
+ suffdec = (norm([rdp; rcp; rpp]) <= (1-alpha*s)*resnorm);
+ s = beta*s;
+ backiter = backiter + 1;
+if (backiter > 32)
+ disp('Stuck backtracking, returning last iterate. (See Section 4 of notes for moreinformation.)')
+ xp = x;
+return
+end
+end
+
+
+ % next iteration
+ x = xp; u = up;
+ v = vp; Atv = Atvp;
+ lamu1 = lamu1p; lamu2 = lamu2p;
+ fu1 = fu1p; fu2 = fu2p;
+
+ % surrogate duality gap
+ sdg = -(fu1'*lamu1 + fu2'*lamu2);
+ tau = mu*2*N/sdg;
+ rpri = rpp;
+ rcent = [-lamu1.*fu1; -lamu2.*fu2] - (1/tau);
+ rdual = gradf0 + [lamu1-lamu2; -lamu1-lamu2] + [Atv; zeros(N,1)];
+ resnorm = norm([rdual; rcent; rpri]);
+ done = (sdg < pdtol) | (pditer >= pdmaxiter);
+ fprintf('Iteration = %d, tau = %8.3e, Primal = %8.3e, PDGap = %8.3e, Dual res = %8.3e, Primal res = %8.3e\n',...
+     pditer, tau, sum(u), sdg, norm(rdual), norm(rpri));
+if(largescale)
+ fprintf('CG Res = %8.3e, CG Iter = %d\n', cgres, cgiter);
+else
+ fprintf('H11p condition number = %8.3e\n', hcond);
+end
+end
+end
